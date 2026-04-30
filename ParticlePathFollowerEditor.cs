@@ -12,6 +12,8 @@ namespace Editor
     [CustomEditor(typeof(ParticlePathFollower))]
     public class ParticlePathFollowerEditor : UnityEditor.Editor
     {
+        private const int StartSectionIndex = -2;
+
         /// <summary>
         /// 当前于 Scene 视图内处于聚焦选中状态的控制点索引（-1 为未选中物体）
         /// </summary>
@@ -77,6 +79,139 @@ namespace Editor
                 }
             }
 
+            // 处理所有可选对象的重叠穿透选中逻辑
+            void HandleOverlapSelection(Vector3 clickedWorldPos)
+            {
+                var closeItems = new System.Collections.Generic.List<Vector2Int>();
+
+                // 1. 查找重叠的节点与控制柄 (x = 0)
+                for (int j = 0; j < pathFollower.controlPoints.Length; j++)
+                {
+                    var pos = handleTransform.TransformPoint(pathFollower.controlPoints[j]);
+                    if (Vector3.Distance(pos, clickedWorldPos) < 0.01f) closeItems.Add(new Vector2Int(0, j));
+                }
+
+                // 1.1 查找起始点与起始横截面相关手柄 (x = 2)
+                if (pathFollower.startOffsetData == null)
+                    pathFollower.startOffsetData = new ParticlePathFollower.PathOffsetData();
+
+                var startP0 = handleTransform.TransformPoint(pathFollower.controlPoints[0]);
+                var startP1 = handleTransform.TransformPoint(pathFollower.controlPoints[1]);
+                var startP2 = handleTransform.TransformPoint(pathFollower.controlPoints[2]);
+                var startMidPoint = handleTransform.TransformPoint(ParticlePathFollower.EvaluateCubicBezier(
+                    pathFollower.controlPoints[0],
+                    pathFollower.controlPoints[1],
+                    pathFollower.controlPoints[2],
+                    pathFollower.controlPoints[3], 0.01f));
+
+                var startForward = (startMidPoint - startP0).normalized;
+                if (startForward == Vector3.zero) startForward = Vector3.forward;
+
+                var startRight = Vector3.Cross(startForward, Vector3.forward).normalized;
+                if (startRight == Vector3.zero) startRight = Vector3.right;
+                var startUp = Vector3.Cross(startRight, startForward).normalized;
+
+                var startSegData = pathFollower.startOffsetData;
+                var startMinX = Mathf.Min(startSegData.offset.x, startSegData.offset.y);
+                var startMaxX = Mathf.Max(startSegData.offset.x, startSegData.offset.y);
+                var startMinY = Mathf.Min(startSegData.offset.z, startSegData.offset.w);
+                var startMaxY = Mathf.Max(startSegData.offset.z, startSegData.offset.w);
+
+                var startCenterX = (startMinX + startMaxX) * 0.5f;
+                var startCenterY = (startMinY + startMaxY) * 0.5f;
+                var startExtentX = (startMaxX - startMinX) * 0.5f;
+                var startExtentY = (startMaxY - startMinY) * 0.5f;
+
+                var startCenterWorld = startP0 + startRight * startCenterX + startUp * startCenterY;
+                var startRightPos = startP0 + startRight * startSegData.offset.y + startUp * startCenterY;
+                var startLeftPos = startP0 + startRight * startSegData.offset.x + startUp * startCenterY;
+                var startTopPos = startP0 + startRight * startCenterX + startUp * startSegData.offset.w;
+                var startBottomPos = startP0 + startRight * startCenterX + startUp * startSegData.offset.z;
+
+                if (Vector3.Distance(startP0, clickedWorldPos) < 0.01f || Vector3.Distance(startCenterWorld, clickedWorldPos) < 0.01f)
+                    closeItems.Add(new Vector2Int(2, 0));
+                if (Vector3.Distance(startRightPos, clickedWorldPos) < 0.01f) closeItems.Add(new Vector2Int(2, 2));
+                if (Vector3.Distance(startLeftPos, clickedWorldPos) < 0.01f) closeItems.Add(new Vector2Int(2, 3));
+                if (Vector3.Distance(startTopPos, clickedWorldPos) < 0.01f) closeItems.Add(new Vector2Int(2, 4));
+                if (Vector3.Distance(startBottomPos, clickedWorldPos) < 0.01f) closeItems.Add(new Vector2Int(2, 5));
+
+                // 2. 查找重叠的路径段手柄 (x = 1)
+                int localCCount = (pathFollower.controlPoints.Length - 1) / 3;
+                for (int j = 0; j < localCCount; j++)
+                {
+                    int sIndex = j * 3;
+                    var sPos = handleTransform.TransformPoint(ParticlePathFollower.EvaluateCubicBezier(
+                        pathFollower.controlPoints[sIndex], 
+                        pathFollower.controlPoints[sIndex + 1], 
+                        pathFollower.controlPoints[sIndex + 2], 
+                        pathFollower.controlPoints[sIndex + 3], 0.5f));
+                    if (Vector3.Distance(sPos, clickedWorldPos) < 0.01f) closeItems.Add(new Vector2Int(1, j));
+                }
+
+                if (closeItems.Count > 1)
+                {
+                    int currentIdx = closeItems.FindIndex(item =>
+                        (item.x == 0 && item.y == _selectedIndex) ||
+                        (item.x == 1 && item.y == _selectedSegmentIndex) ||
+                        (item.x == 2 && _selectedSegmentIndex == StartSectionIndex));
+                    int next = (currentIdx + 1) % closeItems.Count;
+                    if (closeItems[next].x == 0)
+                    {
+                        _selectedIndex = closeItems[next].y;
+                        _selectedSegmentIndex = -1;
+                    }
+                    else if (closeItems[next].x == 1)
+                    {
+                        _selectedSegmentIndex = closeItems[next].y;
+                        _selectedIndex = -1;
+                    }
+                    else
+                    {
+                        _selectedIndex = -1;
+                        _selectedSegmentIndex = StartSectionIndex;
+                    }
+                }
+                else if (closeItems.Count == 1)
+                {
+                    if (closeItems[0].x == 0)
+                    {
+                        _selectedIndex = closeItems[0].y;
+                        _selectedSegmentIndex = -1;
+                    }
+                    else if (closeItems[0].x == 1)
+                    {
+                        _selectedSegmentIndex = closeItems[0].y;
+                        _selectedIndex = -1;
+                    }
+                    else
+                    {
+                        _selectedIndex = -1;
+                        _selectedSegmentIndex = StartSectionIndex;
+                    }
+                }
+
+                // 按住 Shift 选中且当前选中的是曲柄点（控制点），恢复同步平滑控制
+                if (Event.current.shift && _selectedIndex >= 0 && _selectedIndex % 3 != 0)
+                {
+                    var isForward = _selectedIndex % 3 == 1;
+                    var anchorIdx = isForward ? _selectedIndex - 1 : _selectedIndex + 1;
+                    var twinIdx = isForward ? _selectedIndex - 2 : _selectedIndex + 2;
+
+                    if (twinIdx >= 0 && twinIdx < pathFollower.controlPoints.Length)
+                    {
+                        Undo.RecordObject(pathFollower, "Restore Smooth");
+                        var anchorPos = pathFollower.controlPoints[anchorIdx];
+                        var myPos = pathFollower.controlPoints[_selectedIndex];
+                        var oppositeDir = (anchorPos - myPos).normalized;
+                        var myDist = Vector3.Distance(anchorPos, myPos);
+                        pathFollower.controlPoints[twinIdx] = anchorPos + oppositeDir * myDist;
+                        EditorUtility.SetDirty(pathFollower);
+                    }
+                }
+
+                Repaint();
+            }
+
             // 绘制控制点手柄
             for (var i = 0; i < pathFollower.controlPoints.Length; i++)
             {
@@ -92,28 +227,7 @@ namespace Editor
                 // 使用 Button 代替单纯的 SphereHandleCap，点击时可以选中该点
                 if (Handles.Button(p, handleRotation, dotSize, dotSize, Handles.SphereHandleCap))
                 {
-                    _selectedIndex = i;
-
-                    // 如果按住 Shift 选中且当前选中的是曲柄点（控制点），则以其自身为准将对面的曲柄强行拉回对称状态，恢复同步控制
-                    if (Event.current.shift && i % 3 != 0)
-                    {
-                        var isForward = i % 3 == 1;
-                        var anchorIdx = isForward ? i - 1 : i + 1;
-                        var twinIdx = isForward ? i - 2 : i + 2;
-
-                        if (twinIdx >= 0 && twinIdx < pathFollower.controlPoints.Length)
-                        {
-                            Undo.RecordObject(pathFollower, "Restore Smooth");
-                            var anchorPos = pathFollower.controlPoints[anchorIdx];
-                            var myPos = pathFollower.controlPoints[i];
-                            var oppositeDir = (anchorPos - myPos).normalized;
-                            var myDist = Vector3.Distance(anchorPos, myPos);
-                            pathFollower.controlPoints[twinIdx] = anchorPos + oppositeDir * myDist;
-                            EditorUtility.SetDirty(pathFollower);
-                        }
-                    }
-
-                    Repaint();
+                    HandleOverlapSelection(p);
                 }
 
                 // 只有被选中的控制点才显示位移坐标轴
@@ -208,6 +322,157 @@ namespace Editor
                 }
             }
 
+            // 绘制起始点的局部横截面手柄，用于定义路径起点的初始偏移大小
+            if (pathFollower.startOffsetData == null)
+                pathFollower.startOffsetData = new ParticlePathFollower.PathOffsetData();
+
+            var startP0 = handleTransform.TransformPoint(pathFollower.controlPoints[0]);
+            var startP1 = handleTransform.TransformPoint(pathFollower.controlPoints[1]);
+            var startP2 = handleTransform.TransformPoint(pathFollower.controlPoints[2]);
+            var startP3 = handleTransform.TransformPoint(pathFollower.controlPoints[3]);
+            var startMidPoint = handleTransform.TransformPoint(ParticlePathFollower.EvaluateCubicBezier(
+                pathFollower.controlPoints[0],
+                pathFollower.controlPoints[1],
+                pathFollower.controlPoints[2],
+                pathFollower.controlPoints[3], 0.01f));
+
+            var startForward = (startMidPoint - startP0).normalized;
+            if (startForward == Vector3.zero) startForward = Vector3.forward;
+
+            var startRight = Vector3.Cross(startForward, Vector3.forward).normalized;
+            if (startRight == Vector3.zero) startRight = Vector3.right;
+            var startUp = Vector3.Cross(startRight, startForward).normalized;
+
+            var startSegData = pathFollower.startOffsetData;
+            var startMinX = Mathf.Min(startSegData.offset.x, startSegData.offset.y);
+            var startMaxX = Mathf.Max(startSegData.offset.x, startSegData.offset.y);
+            var startMinY = Mathf.Min(startSegData.offset.z, startSegData.offset.w);
+            var startMaxY = Mathf.Max(startSegData.offset.z, startSegData.offset.w);
+
+            var startCenterX = (startMinX + startMaxX) * 0.5f;
+            var startCenterY = (startMinY + startMaxY) * 0.5f;
+            var startExtentX = (startMaxX - startMinX) * 0.5f;
+            var startExtentY = (startMaxY - startMinY) * 0.5f;
+
+            var startAnchorWorld = startP0;
+
+            if (_selectedSegmentIndex == StartSectionIndex)
+            {
+                EditorGUI.BeginChangeCheck();
+                startAnchorWorld = Handles.DoPositionHandle(startAnchorWorld, handleRotation);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    Undo.RecordObject(pathFollower, "Move Start Point");
+
+                    var newLocalPos = handleTransform.InverseTransformPoint(startAnchorWorld);
+                    var delta = newLocalPos - pathFollower.controlPoints[0];
+
+                    pathFollower.controlPoints[0] = newLocalPos;
+                    if (pathFollower.controlPoints.Length > 1)
+                        pathFollower.controlPoints[1] += delta;
+
+                    EditorUtility.SetDirty(pathFollower);
+                }
+            }
+
+            var startCenterWorld = startAnchorWorld + startRight * startCenterX + startUp * startCenterY;
+
+            Handles.color = _selectedSegmentIndex == StartSectionIndex ? Color.cyan : new Color(0.5f, 1f, 0.6f, 0.45f);
+            var startHandleSize = HandleUtility.GetHandleSize(startP0) * 0.12f;
+            if (_selectedSegmentIndex != StartSectionIndex && Handles.Button(startAnchorWorld, handleRotation, startHandleSize, startHandleSize, Handles.CubeHandleCap))
+            {
+                _selectedSegmentIndex = StartSectionIndex;
+                _selectedIndex = -1;
+                Repaint();
+            }
+
+            if (_selectedSegmentIndex == StartSectionIndex)
+            {
+                Handles.color = Color.cyan;
+                if (pathFollower.circularShape)
+                {
+                    DrawEllipseWire(startCenterWorld, startForward, startRight, startUp, startExtentX, startExtentY);
+                    if (pathFollower.enableInnerVacuum)
+                    {
+                        Handles.color = Color.red;
+                        DrawEllipseWire(startCenterWorld, startForward, startRight, startUp, startExtentX * startSegData.innerVacuumX, startExtentY * startSegData.innerVacuumY);
+                    }
+                }
+                else
+                {
+                    DrawRectWire(startCenterWorld, startRight, startUp, startExtentX, startExtentY);
+                    if (pathFollower.enableInnerVacuum)
+                    {
+                        Handles.color = Color.red;
+                        DrawRectWire(startCenterWorld, startRight, startUp, startExtentX * startSegData.innerVacuumX, startExtentY * startSegData.innerVacuumY);
+                    }
+                }
+
+                var startRightPos = startAnchorWorld + startRight * startSegData.offset.y + startUp * startCenterY;
+                var startLeftPos = startAnchorWorld + startRight * startSegData.offset.x + startUp * startCenterY;
+                var startTopPos = startAnchorWorld + startRight * startCenterX + startUp * startSegData.offset.w;
+                var startBottomPos = startAnchorWorld + startRight * startCenterX + startUp * startSegData.offset.z;
+
+                Handles.color = Color.yellow;
+
+                var startHandleSizeR = HandleUtility.GetHandleSize(startRightPos) * 0.08f;
+                var startHandleSizeL = HandleUtility.GetHandleSize(startLeftPos) * 0.08f;
+                var startHandleSizeT = HandleUtility.GetHandleSize(startTopPos) * 0.08f;
+                var startHandleSizeB = HandleUtility.GetHandleSize(startBottomPos) * 0.08f;
+
+                void ProcessStartSlider(int axis, Vector3 pos, Vector3 slideDir, float size, Vector3 projAxis, bool isNegativeAxis)
+                {
+                    EditorGUI.BeginChangeCheck();
+                    var newPos = Handles.Slider(pos, slideDir, size, Handles.CubeHandleCap, 0);
+                    if (EditorGUI.EndChangeCheck())
+                    {
+                        Undo.RegisterCompleteObjectUndo(pathFollower, "Change Start Segment Bounds");
+
+                        if (_draggingAxis != axis)
+                        {
+                            _draggingAxis = axis;
+                            _dragStartBounds = startSegData.offset;
+                        }
+
+                        float absVal = Vector3.Dot(newPos - startP0, projAxis);
+                        float startVal = axis == 0 ? _dragStartBounds.x : (axis == 1 ? _dragStartBounds.y : (axis == 2 ? _dragStartBounds.z : _dragStartBounds.w));
+                        float activeDelta = isNegativeAxis ? -(absVal - startVal) : (absVal - startVal);
+
+                        if (Event.current.shift)
+                        {
+                            startSegData.offset.x = _dragStartBounds.x - activeDelta;
+                            startSegData.offset.y = _dragStartBounds.y + activeDelta;
+                            startSegData.offset.z = _dragStartBounds.z - activeDelta;
+                            startSegData.offset.w = _dragStartBounds.w + activeDelta;
+                        }
+                        else
+                        {
+                            startSegData.offset = _dragStartBounds;
+                            if (axis == 0) startSegData.offset.x = absVal;
+                            else if (axis == 1) startSegData.offset.y = absVal;
+                            else if (axis == 2) startSegData.offset.z = absVal;
+                            else if (axis == 3) startSegData.offset.w = absVal;
+                        }
+
+                        EditorUtility.SetDirty(pathFollower);
+                    }
+                }
+
+                if (Handles.Button(startRightPos, handleRotation, startHandleSizeR, startHandleSizeR, Handles.CubeHandleCap))
+                    HandleOverlapSelection(startRightPos);
+                if (Handles.Button(startLeftPos, handleRotation, startHandleSizeL, startHandleSizeL, Handles.CubeHandleCap))
+                    HandleOverlapSelection(startLeftPos);
+                if (Handles.Button(startTopPos, handleRotation, startHandleSizeT, startHandleSizeT, Handles.CubeHandleCap))
+                    HandleOverlapSelection(startTopPos);
+                if (Handles.Button(startBottomPos, handleRotation, startHandleSizeB, startHandleSizeB, Handles.CubeHandleCap))
+                    HandleOverlapSelection(startBottomPos);
+
+                ProcessStartSlider(1, startRightPos, startRight, startHandleSizeR, startRight, false);
+                ProcessStartSlider(0, startLeftPos, -startRight, startHandleSizeL, startRight, true);
+                ProcessStartSlider(3, startTopPos, startUp, startHandleSizeT, startUp, false);
+                ProcessStartSlider(2, startBottomPos, -startUp, startHandleSizeB, startUp, true);
+            }
+
             // 绘制所有贝塞尔曲线段和辅助线及局部的横截面范围
             Handles.color = Color.white;
             var curveCount = (pathFollower.controlPoints.Length - 1) / 3;
@@ -244,9 +509,7 @@ namespace Editor
 
                 if (Handles.Button(segmentCenter, handleRotation, midSize, midSize, Handles.CubeHandleCap))
                 {
-                    _selectedSegmentIndex = i;
-                    _selectedIndex = -1; // 互斥撤销节点全选
-                    Repaint();
+                    HandleOverlapSelection(segmentCenter);
                 }
 
                 // 只有处于选中状态或者是局部截面时，绘制这段截面真空范围圈
@@ -420,7 +683,7 @@ namespace Editor
                 if (GUILayout.Button("选中", GUILayout.Width(50)))
                 {
                     _selectedIndex = i;
-                    _selectedSegmentIndex = -1;
+                    _selectedSegmentIndex = i == 0 ? StartSectionIndex : -1;
                     SceneView.RepaintAll(); // 强制刷新 Scene 视图显式定位柄
                 }
 
@@ -441,6 +704,34 @@ namespace Editor
 
                 GUI.backgroundColor = Color.white;
                 EditorGUILayout.EndHorizontal();
+            }
+
+            // 绘制当前选中的控制柄(点)的详细信息
+            if (_selectedIndex >= 0 && _selectedIndex < pathFollower.controlPoints.Length)
+            {
+                GUILayout.Space(10);
+                EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+                string pointType = (_selectedIndex % 3 == 0) ? "节点 (Anchor)" : "控制柄 (Tangent)";
+                EditorGUILayout.LabelField($"当前选中: {pointType} - 索引 {_selectedIndex}", EditorStyles.boldLabel);
+
+                EditorGUI.BeginChangeCheck();
+                var newSelectedPos = EditorGUILayout.Vector3Field("局部坐标 (Local Position)", pathFollower.controlPoints[_selectedIndex]);
+                if (EditorGUI.EndChangeCheck())
+                {
+                    Undo.RecordObject(pathFollower, "Change Selected Point");
+                    var delta = newSelectedPos - pathFollower.controlPoints[_selectedIndex];
+                    pathFollower.controlPoints[_selectedIndex] = newSelectedPos;
+
+                    // 如果移动的是锚点，也要一起动控制点
+                    if (_selectedIndex % 3 == 0)
+                    {
+                        if (_selectedIndex - 1 >= 0) pathFollower.controlPoints[_selectedIndex - 1] += delta;
+                        if (_selectedIndex + 1 < pathFollower.controlPoints.Length) pathFollower.controlPoints[_selectedIndex + 1] += delta;
+                    }
+                    EditorUtility.SetDirty(pathFollower);
+                    SceneView.RepaintAll();
+                }
+                EditorGUILayout.EndVertical();
             }
 
             // 绘制当前选中的特定路径段的局部横截面独立属性调控面板
@@ -469,7 +760,31 @@ namespace Editor
                 EditorGUILayout.EndVertical();
             }
 
-            GUILayout.Space(10);
+            if (_selectedSegmentIndex == StartSectionIndex)
+            {
+                GUILayout.Space(10);
+
+                EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+                EditorGUILayout.LabelField("起始点局部横截面", EditorStyles.boldLabel);
+
+                EditorGUI.BeginChangeCheck();
+                pathFollower.applyInitialOffsetToWholePath = EditorGUILayout.Toggle("整条路径应用起始偏移", pathFollower.applyInitialOffsetToWholePath);
+                var startSeg = pathFollower.startOffsetData ??= new ParticlePathFollower.PathOffsetData();
+                startSeg.offset = EditorGUILayout.Vector4Field("起始偏移范围", startSeg.offset);
+                if (pathFollower.enableInnerVacuum)
+                {
+                    startSeg.innerVacuumX = EditorGUILayout.Slider("起始真空百分比 X", startSeg.innerVacuumX, 0f, 1f);
+                    startSeg.innerVacuumY = EditorGUILayout.Slider("起始真空百分比 Y", startSeg.innerVacuumY, 0f, 1f);
+                }
+
+                if (EditorGUI.EndChangeCheck())
+                {
+                    Undo.RegisterCompleteObjectUndo(pathFollower, "Change Start Offset");
+                    EditorUtility.SetDirty(pathFollower);
+                    SceneView.RepaintAll();
+                }
+                EditorGUILayout.EndVertical();
+            }
 
             DrawDefaultInspector();
 

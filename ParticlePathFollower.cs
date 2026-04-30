@@ -22,26 +22,45 @@ namespace Script.Particles
             PingPong
         }
 
+        /// <summary>
+        /// 粒子沿路径的推进模式
+        /// </summary>
+        public enum PathTravelMode
+        {
+            OneShot,
+            Loop,
+            PingPong
+        }
+
         [HideInInspector] public Vector3[] controlPoints =
         {
             new(0, 0, 0),
-            new(0, 5, 0),
-            new(5, 5, 0),
-            new(5, 0, 0)
+            new(0, 0, 1),
+            new(0, 0, 4),
+            new(0, 0, 5)
         };
 
         [Header("运动设置")] [Tooltip("粒子沿路径移动的速度")]
         public float speed = 1.0f;
+
+        [Tooltip("路径行进模式（单次、循环、往返）")]
+        public PathTravelMode pathTravelMode = PathTravelMode.OneShot;
+
+        [Tooltip("沿路径进度(0~1)的速度倍率曲线")]
+        public AnimationCurve speedOverPath = AnimationCurve.Linear(0f, 1f, 1f, 1f);
+
+        [Tooltip("自动生命周期是否计入速度曲线影响")]
+        public bool includeCurveInLifetime = true;
+
+        [Tooltip("速度曲线积分采样数（越大越精确）")] [Range(4, 128)]
+        public int speedSampleCount = 32;
 
         [Tooltip("是否自动根据路径长和速度计算并修改粒子的生命周期")] public bool autoSetLifetime = true;
 
         [Tooltip("是否改变粒子的朝向（使其对齐路径的前进方向）")] public bool alignToPath = true;
 
         [Header("偏移设置")] [Tooltip("垂直于路径的偏移模式")]
-        public OffsetMode offsetMode = OffsetMode.None;
-
-        [Tooltip("偏移范围（X/Y：水平/左右方向的最小与最大值，Z/W：垂直/上下方向的最小与最大值）")]
-        public Vector4 offset = Vector4.zero;
+        public OffsetMode offsetMode = OffsetMode.Random;
 
         [Tooltip("是否启用内部真空区（在此范围内不会生成和偏移粒子）")] public bool enableInnerVacuum;
         [Tooltip("是否将偏移范围与真空区映射为圆/椭圆形")] public bool circularShape;
@@ -54,11 +73,18 @@ namespace Script.Particles
             public Vector4 offset = new Vector4(1f, -1f, 1f, -1f);
 
             [Tooltip("水平方向的真空区百分比")] [Range(0f, 1f)]
-            public float innerVacuumX = 0f;
+            public float innerVacuumX;
 
             [Tooltip("垂直方向的真空区百分比")] [Range(0f, 1f)]
-            public float innerVacuumY = 0f;
+            public float innerVacuumY;
         }
+
+        [HideInInspector]
+        public PathOffsetData startOffsetData = new PathOffsetData();
+
+        [HideInInspector]
+        [Tooltip("启用后，整条路径都使用起始点的局部横截面大小；关闭则沿用原有分段偏移逻辑")]
+        public bool applyInitialOffsetToWholePath;
 
         [HideInInspector]
         public PathOffsetData[] segmentOffsets = { new PathOffsetData() };
@@ -79,37 +105,72 @@ namespace Script.Particles
         /// </summary>
         private float _totalPathLength;
 
+        private float[] _motionTimeSamples;
+        private float[] _motionDistanceSamples;
+        private float _oneWayDuration;
+        private int _pathCacheSignature = int.MinValue;
+        private int _motionCacheSignature = int.MinValue;
+
+        private void OnValidate()
+        {
+            speedSampleCount = Mathf.Clamp(speedSampleCount, 4, 128);
+            speedOverPath = SanitizeCurve01(speedOverPath);
+        }
+
         private void LateUpdate()
         {
             InitializeIfNeeded();
             UpdatePathCache();
+            UpdateMotionCache();
+            var main = _particleSystem.main;
+            var simulationSpace = main.simulationSpace;
 
-            // 动态设置粒子的初始生命周期，使其刚好在到达路径终点时（或按设定速度走完全程）消亡
+            // 动态设置粒子的初始生命周期，使其刚好在到达路径终点时消失，避免过早消失或路径末尾堆积
             if (autoSetLifetime && speed > 0.001f)
             {
-                var main = _particleSystem.main;
-                main.startLifetime = _totalPathLength / speed;
+                if (includeCurveInLifetime)
+                {
+                    var modeMultiplier = pathTravelMode == PathTravelMode.PingPong ? 2f : 1f;
+                    main.startLifetime = Mathf.Max(0.01f, _oneWayDuration * modeMultiplier);
+                }
+                else
+                {
+                    main.startLifetime = _totalPathLength / speed;
+                }
             }
 
             var count = _particleSystem.GetParticles(_particles);
 
             for (var i = 0; i < count; i++)
             {
-                // 用粒子的真实存活时间乘以速度得到实际应该行走的物理距离
+                // 根据粒子年龄映射到路径距离，支持速度曲线与路径模式
                 var age = _particles[i].startLifetime - _particles[i].remainingLifetime;
-                var distance = age * speed;
+                var distance = GetDistanceAtAge(age, out var isForwardTravel);
 
                 Vector3 forwardDir;
                 float segIdx;
                 var newPos = GetPointAtDistance(distance, out forwardDir, out segIdx);
-                var currentEffectiveSpeed = speed; // 记录实际速度
+                if (!isForwardTravel) forwardDir = -forwardDir;
+
+                const float velocityDeltaTime = 0.02f;
+                var nextDistance = GetDistanceAtAge(age + velocityDeltaTime, out var nextIsForwardTravel);
+                Vector3 nextForwardDir;
+                float nextSegIdx;
+                var nextBasePos = GetPointAtDistance(nextDistance, out nextForwardDir, out nextSegIdx);
+                if (!nextIsForwardTravel) nextForwardDir = -nextForwardDir;
+
+                var baseDelta = nextBasePos - newPos;
+                var currentEffectiveSpeed = baseDelta.magnitude / velocityDeltaTime;
+
+                if (forwardDir == Vector3.zero && baseDelta != Vector3.zero)
+                    forwardDir = baseDelta.normalized;
 
                 if (offsetMode != OffsetMode.None)
                 {
                     var currentOffsetX = 0f;
                     var currentOffsetY = 0f;
 
-                    var segData = EvaluateOffsetData(segIdx);
+                    EvaluateOffsetData(segIdx, out var segOffset, out var segInnerVacuumX, out var segInnerVacuumY);
 
                     // 计算该粒子的相对固定出生时间，以此作为重复与来回的依据，保证单颗粒子一生中的偏移保持固定，而不是在路径上扭波
                     var spawnTime = Time.time - age;
@@ -120,7 +181,7 @@ namespace Script.Particles
                             // 利用粒子自身的随机种子固定一个随身偏移量，以防止每帧闪烁
                             var randomT1 = _particles[i].randomSeed % 10000 / 10000f;
                             var randomT2 = _particles[i].randomSeed / 10000 % 10000 / 10000f; // 获取另一段随机值
-                            var offRand = CalculateOffset2D(randomT1, randomT2, segData);
+                            var offRand = CalculateOffset2D(randomT1, randomT2, segOffset, segInnerVacuumX, segInnerVacuumY);
                             currentOffsetX = offRand.x;
                             currentOffsetY = offRand.y;
                             break;
@@ -131,7 +192,7 @@ namespace Script.Particles
                             var angleR = tRepeat * Mathf.PI * 2f;
                             var t1R = Mathf.Cos(angleR) * 0.5f + 0.5f;
                             var t2R = Mathf.Sin(angleR) * 0.5f + 0.5f;
-                            var offRepeat = CalculateOffset2D(t1R, t2R, segData);
+                            var offRepeat = CalculateOffset2D(t1R, t2R, segOffset, segInnerVacuumX, segInnerVacuumY);
                             currentOffsetX = offRepeat.x;
                             currentOffsetY = offRepeat.y;
                             break;
@@ -141,7 +202,7 @@ namespace Script.Particles
                             var angleP = tPingPong * Mathf.PI * 2f;
                             var t1P = Mathf.Cos(angleP) * 0.5f + 0.5f;
                             var t2P = Mathf.Sin(angleP) * 0.5f + 0.5f;
-                            var offPing = CalculateOffset2D(t1P, t2P, segData);
+                            var offPing = CalculateOffset2D(t1P, t2P, segOffset, segInnerVacuumX, segInnerVacuumY);
                             currentOffsetX = offPing.x;
                             currentOffsetY = offPing.y;
                             break;
@@ -157,12 +218,6 @@ namespace Script.Particles
 
                         newPos += right * currentOffsetX + up * currentOffsetY;
 
-                        // 差分采取靠近的一小步预测下一个点的位置，进而得出偏移后真实的运动方向和速度率
-                        var delta = 0.05f;
-                        Vector3 nextForwardDir;
-                        float nextSegIdx;
-                        var nextBasePos = GetPointAtDistance(distance + delta, out nextForwardDir, out nextSegIdx);
-
                         var nextRight = Vector3.Cross(nextForwardDir, Vector3.forward).normalized;
                         if (nextRight == Vector3.zero) nextRight = Vector3.right;
                         var nextUp = Vector3.Cross(nextRight, nextForwardDir).normalized;
@@ -173,22 +228,21 @@ namespace Script.Particles
                         var offsetForward = (nextPos - newPos).normalized;
                         if (offsetForward != Vector3.zero) forwardDir = offsetForward;
 
-                        // 距离差除以 delta 表示基于中心路径速度的偏移速度比率（外侧弧长长会大于1，内侧弧长短会小于1）
-                        var speedMultiplier = Vector3.Distance(nextPos, newPos) / delta;
-                        currentEffectiveSpeed = speed * speedMultiplier;
+                        // 基于固定时间步长估算偏移后的真实速度，避免曲率变化时速度跳变
+                        currentEffectiveSpeed = Vector3.Distance(nextPos, newPos) / velocityDeltaTime;
                     }
                 }
 
-                // 将本地坐标系转换到粒子系统的模拟空间（或世界空间）
-                if (_particleSystem.main.simulationSpace == ParticleSystemSimulationSpace.Local)
+                // 将本地坐标系转换到粒子系统的模拟空间，如果是世界空间则保持不变，如果是局部空间则转换为相对于粒子系统的坐标
+                if (simulationSpace == ParticleSystemSimulationSpace.Local)
                     _particles[i].position = newPos;
                 else
                     _particles[i].position = transform.TransformPoint(newPos);
 
-                if (alignToPath && distance <= _totalPathLength)
+                if (alignToPath)
                     if (forwardDir != Vector3.zero)
                     {
-                        // 简单转换朝向（假设是2D旋转，如果是3D粒子需要设置3D旋转）
+                        // 简单转换朝向，不支持3D粒子
                         var angle = Mathf.Atan2(forwardDir.y, forwardDir.x) * Mathf.Rad2Deg;
                         _particles[i].rotation = angle;
                         _particles[i].velocity = forwardDir * currentEffectiveSpeed; // 更新速度向量，利用真实速度
@@ -214,6 +268,10 @@ namespace Script.Particles
         private void UpdatePathCache(int stepsPerCurve = 25)
         {
             if (controlPoints == null || controlPoints.Length < 4) return;
+
+            var signature = ComputePathCacheSignature(stepsPerCurve);
+            if (signature == _pathCacheSignature && _pathPoints != null && _pathPoints.Length > 1 && _pathDistances != null && _pathForwards != null)
+                return;
 
             var curveCount = (controlPoints.Length - 1) / 3;
             var totalSteps = curveCount * stepsPerCurve;
@@ -248,6 +306,226 @@ namespace Script.Particles
             }
 
             _totalPathLength = length;
+            _pathCacheSignature = signature;
+        }
+
+        /// <summary>
+        /// 构建距离-时间查找表，用于支持沿路径的速度曲线积分与反查。
+        /// </summary>
+        private void UpdateMotionCache()
+        {
+            var sampleCount = Mathf.Max(4, speedSampleCount);
+            var signature = ComputeMotionCacheSignature(sampleCount);
+
+            if (signature == _motionCacheSignature && _motionTimeSamples != null && _motionTimeSamples.Length == sampleCount + 1 && _motionDistanceSamples != null && _motionDistanceSamples.Length == sampleCount + 1)
+                return;
+
+            if (_motionTimeSamples == null || _motionTimeSamples.Length != sampleCount + 1 ||
+                _motionDistanceSamples == null || _motionDistanceSamples.Length != sampleCount + 1)
+            {
+                _motionTimeSamples = new float[sampleCount + 1];
+                _motionDistanceSamples = new float[sampleCount + 1];
+            }
+
+            if (_totalPathLength <= 0.0001f || speed <= 0.0001f)
+            {
+                _oneWayDuration = 0f;
+                for (var i = 0; i <= sampleCount; i++)
+                {
+                    _motionDistanceSamples[i] = 0f;
+                    _motionTimeSamples[i] = 0f;
+                }
+
+                _motionCacheSignature = signature;
+
+                return;
+            }
+
+            _motionDistanceSamples[0] = 0f;
+            _motionTimeSamples[0] = 0f;
+
+            var cumulativeTime = 0f;
+            var stepDistance = _totalPathLength / sampleCount;
+
+            for (var i = 1; i <= sampleCount; i++)
+            {
+                var t0 = (float)(i - 1) / sampleCount;
+                var t1 = (float)i / sampleCount;
+                var m0 = Mathf.Max(0.0001f, speedOverPath.Evaluate(t0));
+                var m1 = Mathf.Max(0.0001f, speedOverPath.Evaluate(t1));
+                var avgMultiplier = (m0 + m1) * 0.5f;
+
+                cumulativeTime += stepDistance / (speed * avgMultiplier);
+
+                _motionDistanceSamples[i] = stepDistance * i;
+                _motionTimeSamples[i] = cumulativeTime;
+            }
+
+            _oneWayDuration = cumulativeTime;
+            _motionCacheSignature = signature;
+        }
+
+        private int ComputePathCacheSignature(int stepsPerCurve)
+        {
+            unchecked
+            {
+                var hash = 17;
+                hash = hash * 31 + stepsPerCurve;
+                hash = hash * 31 + (controlPoints?.Length ?? 0);
+
+                if (controlPoints != null)
+                    for (var i = 0; i < controlPoints.Length; i++)
+                        hash = hash * 31 + controlPoints[i].GetHashCode();
+
+                return hash;
+            }
+        }
+
+        private int ComputeMotionCacheSignature(int sampleCount)
+        {
+            unchecked
+            {
+                var hash = 17;
+                hash = hash * 31 + sampleCount;
+                hash = hash * 31 + speed.GetHashCode();
+                hash = hash * 31 + _totalPathLength.GetHashCode();
+
+                if (speedOverPath != null)
+                {
+                    hash = hash * 31 + speedOverPath.length;
+                    hash = hash * 31 + speedOverPath.Evaluate(0.25f).GetHashCode();
+                    hash = hash * 31 + speedOverPath.Evaluate(0.5f).GetHashCode();
+                    hash = hash * 31 + speedOverPath.Evaluate(0.75f).GetHashCode();
+                }
+
+                return hash;
+            }
+        }
+
+        /// <summary>
+        /// 将曲线约束到 x/y 都为 0~1，并保证首尾关键帧覆盖整个横轴。
+        /// </summary>
+        private static AnimationCurve SanitizeCurve01(AnimationCurve curve)
+        {
+            if (curve == null || curve.length == 0)
+                return AnimationCurve.Linear(0f, 1f, 1f, 1f);
+
+            var keys = curve.keys;
+            for (var i = 0; i < keys.Length; i++)
+            {
+                var key = keys[i];
+                key.time = Mathf.Clamp01(key.time);
+                key.value = Mathf.Clamp01(key.value);
+                keys[i] = key;
+            }
+
+            Array.Sort(keys, (a, b) => a.time.CompareTo(b.time));
+
+            if (keys.Length == 0)
+            {
+                keys = new[]
+                {
+                    new Keyframe(0f, 1f),
+                    new Keyframe(1f, 1f)
+                };
+            }
+            else
+            {
+                if (keys[0].time > 0f)
+                    Array.Resize(ref keys, keys.Length + 1);
+
+                if (keys[0].time > 0f)
+                {
+                    Array.Copy(keys, 0, keys, 1, keys.Length - 1);
+                    keys[0] = new Keyframe(0f, Mathf.Clamp01(keys[1].value));
+                }
+                else
+                {
+                    var first = keys[0];
+                    first.time = 0f;
+                    first.value = Mathf.Clamp01(first.value);
+                    keys[0] = first;
+                }
+
+                var lastIndex = keys.Length - 1;
+                if (keys[lastIndex].time < 1f)
+                {
+                    Array.Resize(ref keys, keys.Length + 1);
+                    keys[^1] = new Keyframe(1f, Mathf.Clamp01(keys[^2].value));
+                }
+                else
+                {
+                    var last = keys[lastIndex];
+                    last.time = 1f;
+                    last.value = Mathf.Clamp01(last.value);
+                    keys[lastIndex] = last;
+                }
+            }
+
+            var sanitized = new AnimationCurve(keys)
+            {
+                preWrapMode = WrapMode.ClampForever,
+                postWrapMode = WrapMode.ClampForever
+            };
+            return sanitized;
+        }
+
+        private float GetDistanceAtAge(float age, out bool isForwardTravel)
+        {
+            isForwardTravel = true;
+            if (_totalPathLength <= 0.0001f || speed <= 0.0001f || _oneWayDuration <= 0.0001f)
+                return 0f;
+
+            switch (pathTravelMode)
+            {
+                case PathTravelMode.Loop:
+                {
+                    var localTime = Mathf.Repeat(age, _oneWayDuration);
+                    return GetDistanceAtTime(localTime);
+                }
+                case PathTravelMode.PingPong:
+                {
+                    var period = _oneWayDuration * 2f;
+                    var localTime = Mathf.Repeat(age, period);
+
+                    if (localTime <= _oneWayDuration)
+                        return GetDistanceAtTime(localTime);
+
+                    isForwardTravel = false;
+                    return GetDistanceAtTime(period - localTime);
+                }
+                default:
+                {
+                    var clamped = Mathf.Clamp(age, 0f, _oneWayDuration);
+                    return GetDistanceAtTime(clamped);
+                }
+            }
+        }
+
+        private float GetDistanceAtTime(float elapsedTime)
+        {
+            if (_motionTimeSamples == null || _motionTimeSamples.Length < 2)
+                return 0f;
+
+            if (elapsedTime <= 0f)
+                return 0f;
+
+            var last = _motionTimeSamples.Length - 1;
+            if (elapsedTime >= _motionTimeSamples[last])
+                return _motionDistanceSamples[last];
+
+            var idx = Array.BinarySearch(_motionTimeSamples, elapsedTime);
+            if (idx >= 0)
+                return _motionDistanceSamples[idx];
+
+            var right = ~idx;
+            var left = Mathf.Max(0, right - 1);
+            right = Mathf.Min(last, right);
+
+            var t0 = _motionTimeSamples[left];
+            var t1 = _motionTimeSamples[right];
+            var lerp = (elapsedTime - t0) / Mathf.Max(0.0001f, t1 - t0);
+            return Mathf.Lerp(_motionDistanceSamples[left], _motionDistanceSamples[right], lerp);
         }
 
         /// <summary>
@@ -257,7 +535,7 @@ namespace Script.Particles
         /// <param name="t1">第一轴向插值参数 (0~1)</param>
         /// <param name="t2">第二轴向插值参数 (0~1)</param>
         /// <returns>处理真空裁切及圆平滑折变后的最终 2D 实际偏移值</returns>
-        private Vector2 CalculateOffset2D(float t1, float t2, PathOffsetData segData)
+        private Vector2 CalculateOffset2D(float t1, float t2, Vector4 offset, float innerVacuumX, float innerVacuumY)
         {
             // 映射到 -1 到 +1 标准化包围盒
             var px = Mathf.Lerp(-1f, 1f, t1);
@@ -266,8 +544,8 @@ namespace Script.Particles
             // 1. 真空区处理 (2D 射线等比映射法) 避免分离处理产生的十字型空缺
             if (enableInnerVacuum)
             {
-                var vx = Mathf.Clamp01(segData.innerVacuumX);
-                var vy = Mathf.Clamp01(segData.innerVacuumY);
+                var vx = Mathf.Clamp01(innerVacuumX);
+                var vy = Mathf.Clamp01(innerVacuumY);
 
                 if (vx > 0f || vy > 0f)
                 {
@@ -311,10 +589,10 @@ namespace Script.Particles
             }
 
             // 3. 将最终得到的形状与镂空投射到真实世界偏移参数系
-            var minX = Mathf.Min(segData.offset.x, segData.offset.y);
-            var maxX = Mathf.Max(segData.offset.x, segData.offset.y);
-            var minY = Mathf.Min(segData.offset.z, segData.offset.w);
-            var maxY = Mathf.Max(segData.offset.z, segData.offset.w);
+            var minX = Mathf.Min(offset.x, offset.y);
+            var maxX = Mathf.Max(offset.x, offset.y);
+            var minY = Mathf.Min(offset.z, offset.w);
+            var maxY = Mathf.Max(offset.z, offset.w);
 
             var centerX = (minX + maxX) * 0.5f;
             var centerY = (minY + maxY) * 0.5f;
@@ -325,34 +603,131 @@ namespace Script.Particles
             var finalY = centerY + py * extentY;
 
             // 补偿原始设定如果存在倒置的要求
-            if (segData.offset.x > segData.offset.y) finalX = centerX - px * extentX;
-            if (segData.offset.z > segData.offset.w) finalY = centerY - py * extentY;
+            if (offset.x > offset.y) finalX = centerX - px * extentX;
+            if (offset.z > offset.w) finalY = centerY - py * extentY;
 
             return new Vector2(finalX, finalY);
         }
 
-        private PathOffsetData EvaluateOffsetData(float floatSegIdx)
+        private void EvaluateOffsetData(float floatSegIdx, out Vector4 offset, out float innerVacuumX, out float innerVacuumY)
         {
-            if (segmentOffsets == null || segmentOffsets.Length == 0) return new PathOffsetData();
-            if (segmentOffsets.Length == 1) return segmentOffsets[0];
-
-            // 视每段偏移数据位于段落实体参数时间的中心(0.5, 1.5...)，对其进行连续线性插值过渡
-            float shiftedIdx = floatSegIdx - 0.5f;
-            if (shiftedIdx <= 0f) return segmentOffsets[0];
-            if (shiftedIdx >= segmentOffsets.Length - 1) return segmentOffsets[^1];
-
-            int idx = Mathf.FloorToInt(shiftedIdx);
-            float t = shiftedIdx - idx;
-
-            var d1 = segmentOffsets[idx];
-            var d2 = segmentOffsets[idx + 1];
-
-            return new PathOffsetData
+            if (applyInitialOffsetToWholePath)
             {
-                offset = Vector4.Lerp(d1.offset, d2.offset, t),
-                innerVacuumX = Mathf.Lerp(d1.innerVacuumX, d2.innerVacuumX, t),
-                innerVacuumY = Mathf.Lerp(d1.innerVacuumY, d2.innerVacuumY, t)
-            };
+                var startData = startOffsetData != null ? startOffsetData : new PathOffsetData();
+                offset = startData.offset;
+                innerVacuumX = startData.innerVacuumX;
+                innerVacuumY = startData.innerVacuumY;
+                return;
+            }
+
+            if (segmentOffsets == null || segmentOffsets.Length == 0)
+            {
+                offset = default;
+                innerVacuumX = 0f;
+                innerVacuumY = 0f;
+                return;
+            }
+            if (segmentOffsets.Length == 1)
+            {
+                var single = segmentOffsets[0] ?? new PathOffsetData();
+                offset = single.offset;
+                innerVacuumX = single.innerVacuumX;
+                innerVacuumY = single.innerVacuumY;
+                return;
+            }
+
+            EvaluateSegmentOffsetData(floatSegIdx, out var baseOffset, out var baseInnerVacuumX, out var baseInnerVacuumY);
+
+            // 起始横截面只在第一段前半段叠加，随后完全交回给原有段间连续过渡
+            if (floatSegIdx <= 0.5f)
+            {
+                var startData = startOffsetData != null ? startOffsetData : new PathOffsetData();
+                var blendT = Mathf.Clamp01(floatSegIdx / 0.5f);
+
+                offset = Vector4.Lerp(startData.offset, baseOffset, blendT);
+                innerVacuumX = Mathf.Lerp(startData.innerVacuumX, baseInnerVacuumX, blendT);
+                innerVacuumY = Mathf.Lerp(startData.innerVacuumY, baseInnerVacuumY, blendT);
+                return;
+            }
+
+            offset = baseOffset;
+            innerVacuumX = baseInnerVacuumX;
+            innerVacuumY = baseInnerVacuumY;
+        }
+
+        private void EvaluateSegmentOffsetData(float floatSegIdx, out Vector4 offset, out float innerVacuumX, out float innerVacuumY)
+        {
+            if (segmentOffsets == null || segmentOffsets.Length == 0)
+            {
+                offset = default;
+                innerVacuumX = 0f;
+                innerVacuumY = 0f;
+                return;
+            }
+            if (segmentOffsets.Length == 1)
+            {
+                var single = segmentOffsets[0] ?? new PathOffsetData();
+                offset = single.offset;
+                innerVacuumX = single.innerVacuumX;
+                innerVacuumY = single.innerVacuumY;
+                return;
+            }
+
+            // 在每个连接点两侧各保留一段窄窗口做平滑过渡，避免整点索引处出现跳变。
+            const float transitionHalfWidth = 0.2f;
+
+            if (floatSegIdx <= 0f)
+            {
+                var first = segmentOffsets[0] ?? new PathOffsetData();
+                offset = first.offset;
+                innerVacuumX = first.innerVacuumX;
+                innerVacuumY = first.innerVacuumY;
+                return;
+            }
+            if (floatSegIdx >= segmentOffsets.Length - 1)
+            {
+                var lastData = segmentOffsets[^1] ?? new PathOffsetData();
+                offset = lastData.offset;
+                innerVacuumX = lastData.innerVacuumX;
+                innerVacuumY = lastData.innerVacuumY;
+                return;
+            }
+
+            var segIdx = Mathf.FloorToInt(floatSegIdx);
+            segIdx = Mathf.Clamp(segIdx, 0, segmentOffsets.Length - 1);
+
+            var localT = floatSegIdx - segIdx;
+            var currentData = segmentOffsets[segIdx] ?? new PathOffsetData();
+
+            // 靠近左侧连接点：在 [0, transitionHalfWidth] 内由上一段平滑过渡到当前段
+            if (segIdx > 0 && localT < transitionHalfWidth)
+            {
+                var prevData = segmentOffsets[segIdx - 1] ?? new PathOffsetData();
+                var t = Mathf.Clamp01(localT / transitionHalfWidth);
+                t = t * t * (3f - 2f * t); // SmoothStep
+
+                offset = Vector4.Lerp(prevData.offset, currentData.offset, t);
+                innerVacuumX = Mathf.Lerp(prevData.innerVacuumX, currentData.innerVacuumX, t);
+                innerVacuumY = Mathf.Lerp(prevData.innerVacuumY, currentData.innerVacuumY, t);
+                return;
+            }
+
+            // 靠近右侧连接点：在 [1-transitionHalfWidth, 1] 内由当前段平滑过渡到下一段
+            if (segIdx < segmentOffsets.Length - 1 && localT > 1f - transitionHalfWidth)
+            {
+                var nextData = segmentOffsets[segIdx + 1] ?? new PathOffsetData();
+                var t = Mathf.Clamp01((localT - (1f - transitionHalfWidth)) / transitionHalfWidth);
+                t = t * t * (3f - 2f * t); // SmoothStep
+
+                offset = Vector4.Lerp(currentData.offset, nextData.offset, t);
+                innerVacuumX = Mathf.Lerp(currentData.innerVacuumX, nextData.innerVacuumX, t);
+                innerVacuumY = Mathf.Lerp(currentData.innerVacuumY, nextData.innerVacuumY, t);
+                return;
+            }
+
+            offset = currentData.offset;
+            innerVacuumX = currentData.innerVacuumX;
+            innerVacuumY = currentData.innerVacuumY;
         }
 
         /// <summary>
@@ -391,25 +766,20 @@ namespace Script.Particles
             var totalSteps = _pathDistances.Length - 1;
             var stepPerCurve = totalSteps / (float)Mathf.Max(1, curveCount);
 
-            for (var i = 1; i < _pathDistances.Length; i++)
-                if (_pathDistances[i] >= targetDistance)
-                {
-                    var d0 = _pathDistances[i - 1];
-                    var d1 = _pathDistances[i];
-                    var t = (targetDistance - d0) / (d1 - d0);
-                    var pos = Vector3.Lerp(_pathPoints[i - 1], _pathPoints[i], t);
-                    // 核心修复点：将方向从“死板的折线段”改为插值平滑向量
-                    forward = Vector3.Lerp(_pathForwards[i - 1], _pathForwards[i], t).normalized;
+            var idx = Array.BinarySearch(_pathDistances, targetDistance);
+            if (idx < 0) idx = ~idx;
+            idx = Mathf.Clamp(idx, 1, _pathDistances.Length - 1);
 
-                    var exactStep = (i - 1) + t;
-                    floatSegIdx = exactStep / stepPerCurve;
-                    return pos;
-                }
+            var d0 = _pathDistances[idx - 1];
+            var d1 = _pathDistances[idx];
+            var t = (targetDistance - d0) / Mathf.Max(0.0001f, d1 - d0);
+            var pos = Vector3.Lerp(_pathPoints[idx - 1], _pathPoints[idx], t);
+            // 核心修复点：将方向从“死板的折线段”改为插值平滑向量
+            forward = Vector3.Lerp(_pathForwards[idx - 1], _pathForwards[idx], t).normalized;
 
-            var end = _pathPoints.Length - 1;
-            forward = _pathForwards[end];
-            floatSegIdx = Mathf.Max(0, curveCount);
-            return _pathPoints[end];
+            var exactStep = (idx - 1) + t;
+            floatSegIdx = exactStep / stepPerCurve;
+            return pos;
         }
 
         /// <summary>
