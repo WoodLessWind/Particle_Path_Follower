@@ -11,13 +11,12 @@
 - 支持横截面偏移模式：None、Random、Repeat、PingPong。
 - 支持圆形或椭圆形横截面映射。
 - 支持内部真空区裁切，避免中心区域生成粒子。
-- 支持起始横截面和分段横截面的独立编辑。
 - 提供 Scene 视图手柄，支持拖拽、吸附和对称联动编辑。
 
 ## 文件说明
 
-- [ParticlePathFollower.cs](ParticlePathFollower.cs)：运行时逻辑，负责粒子位置、朝向、偏移和路径缓存。
-- [ParticlePathFollowerEditor.cs](ParticlePathFollowerEditor.cs)：Unity 编辑器扩展，负责 Scene 视图手柄和 Inspector 面板。
+- [ParticlePathFollower.cs](ParticlePathFollower.cs)：运行时逻辑
+- [ParticlePathFollowerEditor.cs](ParticlePathFollowerEditor.cs)：Unity 编辑器扩展
 
 ## 安装
 
@@ -29,10 +28,11 @@
 ## 基本使用
 
 1. 选中带有 ParticlePathFollower 的物体。
-2. 在 Inspector 中编辑路径节点，每 3 个点构成一段三次贝塞尔曲线。
+2. 在 Inspector 中编辑路径节点
 3. 使用“添加路径节点”扩展路径，使用“自动计算平滑”快速生成平顺连接。
 4. 在 Scene 视图中拖动锚点和控制柄，调整曲线形状。
 5. 选中某一段或起始截面后，可直接编辑局部偏移范围和真空参数。
+6. 启用预发射，在开始时就让粒子布满线段
 
 ## 参数说明
 
@@ -45,6 +45,7 @@
 - `speedSampleCount`：速度曲线积分采样数。
 - `autoSetLifetime`：是否自动根据路径长度和速度调整粒子生命周期。
 - `alignToPath`：是否让粒子朝向路径前进方向。
+- `overallRotationCompensation`：粒子偏移补偿。
 
 ### 偏移设置
 
@@ -76,7 +77,6 @@
 
 - 控制点至少需要 4 个，且通常以 3 个点为一组扩展新段。
 - `autoSetLifetime` 开启时，脚本会在运行中自动修改 ParticleSystem 的 startLifetime。
-- 该脚本主要面向二维或平面路径场景，朝向计算默认使用 `Vector3.forward` 作为基准。
 
 ## 示例工作流
 

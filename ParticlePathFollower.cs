@@ -43,7 +43,7 @@ namespace Script.Particles
         [Tooltip("选择另一个同组件对象作为控制点复制来源"),HideInInspector]
         public ParticlePathFollower copySource;
 
-        [Header("运动设置")] [Tooltip("粒子沿路径移动的速度")]
+        [Tooltip("粒子沿路径移动的速度")]
         public float speed = 1.0f;
 
         [Tooltip("路径行进模式（单次、循环、往返）")]
@@ -65,14 +65,13 @@ namespace Script.Particles
         [Tooltip("对 alignToPath 结果统一施加的整体朝向补偿（欧拉角）")]
         public Vector3 overallRotationCompensation = Vector3.zero;
         
-        [Header("偏移设置")] [Tooltip("垂直于路径的偏移模式")]
+        [Tooltip("垂直于路径的偏移模式")]
         public OffsetMode offsetMode = OffsetMode.Random;
 
         [Tooltip("是否启用内部真空区（在此范围内不会生成和偏移粒子）")] public bool enableInnerVacuum;
         [Tooltip("是否将偏移范围与真空区映射为圆/椭圆形")] public bool circularShape;
         [Tooltip("重复/来回模式的频率")] public float offsetFrequency = 1.0f;
 
-        [Header("预发射设置")]
         [Tooltip("启用时进行预发射，使对象显示时已有粒子分布在路径上")]
         public bool prewarmOnEnable = true;
 
