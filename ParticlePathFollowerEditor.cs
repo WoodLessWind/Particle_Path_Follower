@@ -105,6 +105,7 @@ namespace Editor
                     _selectedIndex = -1;
                     _selectedSegmentIndex = -1;
                     EditorUtility.SetDirty(pathFollower);
+                    pathFollower.MarkCachesDirty();
                     Event.current.Use(); // 消耗当前事件避免触发 Unity 默认摧毁物体的热键操作
                 }
             }
@@ -181,6 +182,7 @@ namespace Editor
                         var myDist = Vector3.Distance(anchorPos, myPos);
                         pathFollower.controlPoints[twinIdx] = anchorPos + oppositeDir * myDist;
                         EditorUtility.SetDirty(pathFollower);
+                        pathFollower.MarkCachesDirty();
                     }
                 }
 
@@ -293,6 +295,7 @@ namespace Editor
                         }
 
                         EditorUtility.SetDirty(pathFollower);
+                        pathFollower.MarkCachesDirty();
                     }
                 }
             }
@@ -334,6 +337,47 @@ namespace Editor
                 if (Handles.Button(segmentCenter, handleRotation, midSize, midSize, Handles.CubeHandleCap))
                 {
                     HandleOverlapSelection(segmentCenter);
+                }
+
+                // 支持按住 Shift 在曲线上任意位置点击以插入锚点
+                if (Event.current.shift && Event.current.type == EventType.MouseDown && Event.current.button == 0)
+                {
+                    var mousePos = Event.current.mousePosition;
+                    var ray = HandleUtility.GUIPointToWorldRay(mousePos);
+                    const int sampleCount = 30;
+                    float bestT = 0f;
+                    float bestDist = float.MaxValue;
+
+                    for (int s = 0; s <= sampleCount; s++)
+                    {
+                        var t = s / (float)sampleCount;
+                        var worldSample = handleTransform.TransformPoint(ParticlePathFollower.EvaluateCubicBezier(
+                            pathFollower.controlPoints[startIndex], pathFollower.controlPoints[startIndex + 1],
+                            pathFollower.controlPoints[startIndex + 2], pathFollower.controlPoints[startIndex + 3], t));
+
+                        var toPoint = worldSample - ray.origin;
+                        var proj = Vector3.Dot(toPoint, ray.direction);
+                        var closest = ray.origin + ray.direction * proj;
+                        var dist = Vector3.Distance(worldSample, closest);
+
+                        if (dist < bestDist)
+                        {
+                            bestDist = dist;
+                            bestT = t;
+                        }
+                    }
+
+                    var pickThreshold = HandleUtility.GetHandleSize(segmentCenter) * 0.15f;
+                    if (bestDist < pickThreshold)
+                    {
+                        Undo.RegisterCompleteObjectUndo(pathFollower, "Insert Path Node");
+                        InsertAnchorAt(pathFollower, i, bestT);
+                        EditorUtility.SetDirty(pathFollower);
+                        SceneView.RepaintAll();
+                        Event.current.Use();
+                        // 已经处理此点击，不需要继续对其它段检测
+                        break;
+                    }
                 }
 
                 // 只有处于选中状态或者是局部截面时，绘制这段截面真空范围圈
@@ -468,6 +512,82 @@ namespace Editor
             }
         }
 
+        // 在 segmentIndex 段的 t 位置插入一个锚点（分割该三次贝塞尔为两段）
+        private void InsertAnchorAt(ParticlePathFollower pathFollower, int segmentIndex, float t)
+        {
+            if (pathFollower == null) return;
+
+            var startIndex = segmentIndex * 3;
+            if (pathFollower.controlPoints == null || startIndex + 3 >= pathFollower.controlPoints.Length) return;
+
+            var p0 = pathFollower.controlPoints[startIndex];
+            var p1 = pathFollower.controlPoints[startIndex + 1];
+            var p2 = pathFollower.controlPoints[startIndex + 2];
+            var p3 = pathFollower.controlPoints[startIndex + 3];
+
+            var p01 = Vector3.Lerp(p0, p1, t);
+            var p12 = Vector3.Lerp(p1, p2, t);
+            var p23 = Vector3.Lerp(p2, p3, t);
+
+            var p012 = Vector3.Lerp(p01, p12, t);
+            var p123 = Vector3.Lerp(p12, p23, t);
+
+            var p0123 = Vector3.Lerp(p012, p123, t);
+
+            // 新数组长度增加3
+            var beforeCount = startIndex;
+            var afterCount = pathFollower.controlPoints.Length - (startIndex + 4);
+            var newPoints = new Vector3[pathFollower.controlPoints.Length + 3];
+
+            if (beforeCount > 0) Array.Copy(pathFollower.controlPoints, 0, newPoints, 0, beforeCount);
+
+            int idx = beforeCount;
+            newPoints[idx++] = p0;
+            newPoints[idx++] = p01;
+            newPoints[idx++] = p012;
+            newPoints[idx++] = p0123; // 新锚点
+            newPoints[idx++] = p123;
+            newPoints[idx++] = p23;
+            newPoints[idx++] = p3;
+
+            if (afterCount > 0) Array.Copy(pathFollower.controlPoints, startIndex + 4, newPoints, idx, afterCount);
+
+            // 处理段偏移数据：在当前段之后插入一份复制或新建的数据
+            var oldSegments = pathFollower.segmentOffsets;
+            var newCurveCount = Math.Max(1, (newPoints.Length - 1) / 3);
+            var newSegments = new ParticlePathFollower.PathOffsetData[newCurveCount];
+
+            if (oldSegments != null && oldSegments.Length > 0)
+            {
+                // 复制之前的段
+                var copyBefore = Math.Min(oldSegments.Length, segmentIndex + 1);
+                for (int i = 0; i < copyBefore; i++) newSegments[i] = oldSegments[i];
+
+                // 新插入段，尝试复制原段数据以保持一致性
+                ParticlePathFollower.PathOffsetData toClone = null;
+                if (segmentIndex >= 0 && segmentIndex < oldSegments.Length) toClone = oldSegments[segmentIndex];
+                newSegments[segmentIndex + 1] = toClone != null
+                    ? new ParticlePathFollower.PathOffsetData { offset = toClone.offset, innerVacuumX = toClone.innerVacuumX, innerVacuumY = toClone.innerVacuumY }
+                    : new ParticlePathFollower.PathOffsetData();
+
+                // 复制剩余的段
+                if (oldSegments.Length > segmentIndex + 1)
+                    Array.Copy(oldSegments, segmentIndex + 1, newSegments, segmentIndex + 2, oldSegments.Length - (segmentIndex + 1));
+            }
+            else
+            {
+                for (int i = 0; i < newSegments.Length; i++) newSegments[i] = new ParticlePathFollower.PathOffsetData();
+            }
+
+            pathFollower.controlPoints = newPoints;
+            pathFollower.segmentOffsets = newSegments;
+            pathFollower.MarkCachesDirty();
+
+            // 选中新插入的锚点，位于 startIndex + 3
+            _selectedIndex = startIndex + 3;
+            _selectedSegmentIndex = -1;
+        }
+
         /// <summary>
         /// 重载并定制 Inspector 检查器面板上的布局绘制。
         /// 挂载原组件属性的同时，尾部追加快捷编辑工具触发按钮，用于曲线伸展及连接处极速折角平滑化。
@@ -503,6 +623,7 @@ namespace Editor
 
                     EditorUtility.SetDirty(pathFollower);
                     SceneView.RepaintAll();
+                        pathFollower.MarkCachesDirty();
                 }
 
                 if (GUILayout.Button("选中", GUILayout.Width(50)))
@@ -621,6 +742,7 @@ namespace Editor
                     }
                     EditorUtility.SetDirty(pathFollower);
                     SceneView.RepaintAll();
+                    pathFollower.MarkCachesDirty();
                 }
                 EditorGUILayout.EndVertical();
             }
